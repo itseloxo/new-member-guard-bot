@@ -5,7 +5,7 @@ import json
 import os
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8621256430:AAEbhQNhuHNB02k7S6TDBXa8l1AFo22amEE"  # Your bot token
+BOT_TOKEN = "8621256430:AAG7RhMxO-CoJzu_i83lQSygMYqZGdz0U7M"  # Your bot token
 DB_FILE = "database.json"
 
 # ==================== DATABASE FUNCTIONS ====================
