@@ -5,7 +5,7 @@ import json
 import os
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8621256430:AAEbhQNhuHNB02k7S6TDBXa8l1AFo22amEE"  # Replace with your token from BotFather
+BOT_TOKEN = "8621256430:AAHxwKVaZyBm2HCf1aabF-rbmlnc4TSHhbc"  # Replace with your token from BotFather
 DB_FILE = "database.json"
 
 # ==================== DATABASE FUNCTIONS ====================
