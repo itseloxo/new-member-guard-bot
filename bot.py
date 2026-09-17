@@ -640,46 +640,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         
         # Check if exceeded violation limit
-        if len(member_data["violations"]) >= group_data["violation_limit"]:
-            # Mute the user
-            mute_until = await mute_user(
-                context.application,
-                chat_id,
-                user_id,
-                group_data["mute_duration"]
-            )
-            member_data["mute_until"] = mute_until.isoformat()
-            member_data["violations"] = []  # Reset violations
-            save_db(db)
-            
             await update.message.reply_text(
-                f"🚫 You have been temporarily muted for {format_duration(group_data['mute_duration'])}.\n\n"
-                f"Reason: Sent {len(member_data['violations']) + 1} restricted messages in {format_duration(group_data['violation_window'])}.\n"
-                f"Rule: Maximum {group_data['violation_limit'] - 1} restricted messages allowed in {format_duration(group_data['violation_window'])}.\n\n"
-                f"Please wait until the mute expires."
-            )
+        "🚫 You have been temporarily muted.\n\n"
+        f"Duration: {format_duration(group_data['mute_duration'])}\n"
+        f"Reason: You sent {len(member_data['violations']) + 1} restricted messages (stickers/GIFs/media) "
+        f"in {format_duration(group_data['violation_window'])}.\n"
+        f"Rule: Maximum allowed is {group_data['violation_limit'] - 1} such messages in that time.\n\n"
+        "Please wait until the mute expires."
+    )
         else:
             save_db(db)
             
             # Show warning with progress
-            if group_data["restriction_mode"] == "message":
-                limit = group_data["restriction_value"]
-                count = member_data["message_count"]
-                remaining = max(0, limit - count)
-                
-                await update.message.reply_text(
-                    f"⚠️ You need to send {limit} messages before sending stickers/GIFs.\n\n"
-                    f"📊 You have sent {count} messages so far.\n"
-                    f"📍 {remaining} messages remaining.\n\n"
-                    f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
-                    f"(in {format_duration(group_data['violation_window'])})"
-                )
-            else:
-                await update.message.reply_text(
-                    f"⚠️ You need to wait {group_data['restriction_value']} after joining.\n\n"
-                    f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
-                    f"(in {format_duration(group_data['violation_window'])})"
-                )
+            # Show warning with progress
+if group_data["restriction_mode"] == "message":
+    limit = group_data["restriction_value"]
+    count = member_data["message_count"]
+    remaining = max(0, limit - count)
+
+    await update.message.reply_text(
+        "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
+        f"📊 You have sent {count}/{limit} messages.\n"
+        f"📍 {remaining} messages remaining.\n\n"
+        f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
+        f"(in {format_duration(group_data['violation_window'])})"
+    )
+else:
+    await update.message.reply_text(
+        "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
+        f"⏳ You must wait {group_data['restriction_value']} after joining.\n\n"
+        f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
+        f"(in {format_duration(group_data['violation_window'])})"
+    )
         return
     
     # If text message from restricted user (count it)
