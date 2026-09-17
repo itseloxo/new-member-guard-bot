@@ -5,7 +5,7 @@ import json
 import os
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8621256430:AAHxwKVaZyBm2HCf1aabF-rbmlnc4TSHhbc"  # Replace with your token from BotFather
+BOT_TOKEN = "8621256430:AAEbhQNhuHNB02k7S6TDBXa8l1AFo22amEE"  # Your bot token
 DB_FILE = "database.json"
 
 # ==================== DATABASE FUNCTIONS ====================
@@ -24,10 +24,10 @@ def get_group_data(db, chat_id):
     if chat_id not in db["groups"]:
         db["groups"][chat_id] = {
             "restriction_mode": "message",  # "time" or "message"
-            "restriction_value": 500,  # 500 messages or "3d"
+            "restriction_value": 500,       # 500 messages or "3d"
             "violation_limit": 3,
-            "violation_window": 300,  # 5 minutes in seconds
-            "mute_duration": 3600,  # 1 hour in seconds
+            "violation_window": 300,        # 5 minutes in seconds
+            "mute_duration": 3600,          # 1 hour in seconds
             "members": {},
             "trusted": []
         }
@@ -47,7 +47,6 @@ def get_member_data(group_data, user_id):
 
 # ==================== HELPER FUNCTIONS ====================
 def parse_duration(duration_str):
-    """Convert '5m', '1h', '3d' to seconds"""
     try:
         value = int(duration_str[:-1])
         unit = duration_str[-1].lower()
@@ -63,7 +62,6 @@ def parse_duration(duration_str):
         return None
 
 def format_duration(seconds):
-    """Convert seconds to readable format"""
     if seconds >= 86400:
         return f"{seconds // 86400} days"
     elif seconds >= 3600:
@@ -74,31 +72,24 @@ def format_duration(seconds):
         return f"{seconds} seconds"
 
 async def is_admin(update: Update) -> bool:
-    """Check if user is group admin"""
     user = await update.effective_chat.get_member(update.effective_user.id)
     return user.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
 
 async def is_trusted(group_data, user_id):
-    """Check if user is trusted"""
     return str(user_id) in group_data["trusted"] or str(user_id) in [str(m) for m in group_data["trusted"]]
 
 async def is_restricted(update: Update, group_data, member_data):
-    """Check if user is currently restricted"""
-    # Check if muted
     if member_data["mute_until"]:
         mute_until = datetime.fromisoformat(member_data["mute_until"])
         if datetime.now() < mute_until:
             return True, "muted"
         else:
-            member_data["mute_until"] = None  # Mute expired
-    
-    # Check if unrestricted (trusted or admin)
+            member_data["mute_until"] = None
+
     if member_data["is_unrestricted"]:
         return False, None
-    
-    # Check restriction mode
+
     if group_data["restriction_mode"] == "time":
-        # Time-based restriction
         join_time = datetime.fromisoformat(member_data["join_time"])
         restriction_seconds = parse_duration(str(group_data["restriction_value"]))
         if datetime.now() < join_time + timedelta(seconds=restriction_seconds):
@@ -106,14 +97,12 @@ async def is_restricted(update: Update, group_data, member_data):
         else:
             return False, None
     else:
-        # Message count-based restriction
         if member_data["message_count"] < group_data["restriction_value"]:
             return True, "message"
         else:
             return False, None
 
 async def mute_user(app, chat_id, user_id, duration_seconds):
-    """Mute a user for specified duration"""
     permissions = ChatPermissions(
         can_send_messages=False,
         can_send_audios=False,
@@ -129,7 +118,7 @@ async def mute_user(app, chat_id, user_id, duration_seconds):
         can_invite_users=False,
         can_pin_messages=False,
     )
-    
+
     until_date = datetime.now() + timedelta(seconds=duration_seconds)
     await app.bot.restrict_chat_member(
         chat_id=chat_id,
@@ -140,7 +129,6 @@ async def mute_user(app, chat_id, user_id, duration_seconds):
     return until_date
 
 async def delete_message(app, chat_id, message_id):
-    """Delete a message"""
     try:
         await app.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except:
@@ -148,7 +136,6 @@ async def delete_message(app, chat_id, message_id):
 
 # ==================== COMMAND HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message"""
     await update.message.reply_text(
         "👋 Welcome to NewMemberGuardBot!\n\n"
         "I protect groups from sticker/GIF spam by new members.\n\n"
@@ -160,10 +147,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all commands"""
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
+
     admin_commands = """
 👮 Admin Commands:
 /setrestriction <duration> - Set time restriction (e.g., 3d)
@@ -196,19 +182,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def mycount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check own message count"""
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
     member_data = get_member_data(group_data, update.effective_user.id)
-    
+
     if group_data["restriction_mode"] == "message":
         limit = group_data["restriction_value"]
         count = member_data["message_count"]
         remaining = max(0, limit - count)
-        
+
         if count >= limit:
             await update.message.reply_text(
-                f"✅ Congratulations!\n\n"
+                "✅ Congratulations!\n\n"
                 f"You have sent {count}/{limit} messages.\n"
                 f"You can now send stickers and GIFs! 🎉"
             )
@@ -224,7 +209,7 @@ async def mycount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         restriction_value = str(group_data["restriction_value"])
         restriction_seconds = parse_duration(restriction_value)
         unlock_time = join_time + timedelta(seconds=restriction_seconds)
-        
+
         if datetime.now() >= unlock_time:
             await update.message.reply_text(
                 "✅ Your restriction period has ended!\n"
@@ -240,14 +225,14 @@ async def mycount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show group rules"""
+    """Show group rules – simple and readable"""
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
 
     mode_text = (
-        "Wait {val} after joining.".format(val=group_data['restriction_value'])
+        f"Wait {group_data['restriction_value']} after joining."
         if group_data['restriction_mode'] == 'time'
-        else "Send {val} text messages.".format(val=group_data['restriction_value'])
+        else f"Send {group_data['restriction_value']} text messages."
     )
 
     await update.message.reply_text(
@@ -257,41 +242,40 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ Sending too many restricted messages quickly will get you muted.\n"
         "4️⃣ Be respectful and follow Telegram's Terms of Service."
     )
+
 # ==================== ADMIN COMMANDS ====================
 async def setrestriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set time-based restriction"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
-        await update.message.reply_text("Usage: /setrestriction <duration> (e.g., 3d, 1w)")
+        await update.message.reply_text("Usage: /setrestriction <duration> (e.g., 3d)")
         return
-    
+
     duration = context.args[0].lower()
     seconds = parse_duration(duration)
-    
-    if seconds and seconds >= 86400:  # At least 1 day
+
+    if seconds and seconds >= 86400:
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         group_data["restriction_mode"] = "time"
         group_data["restriction_value"] = duration
         save_db(db)
-        
+
         await update.message.reply_text(f"✅ Time-based restriction set to {duration}")
     else:
         await update.message.reply_text("❌ Duration must be at least 1 day (e.g., 1d, 2d, 7d)")
 
 async def setmsglimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set message count restriction"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /setmsglimit <number> (100-1000)")
         return
-    
+
     try:
         limit = int(context.args[0])
         if 100 <= limit <= 1000:
@@ -300,7 +284,7 @@ async def setmsglimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_data["restriction_mode"] = "message"
             group_data["restriction_value"] = limit
             save_db(db)
-            
+
             await update.message.reply_text(f"✅ Message limit set to {limit} messages")
         else:
             await update.message.reply_text("❌ Limit must be between 100 and 1000")
@@ -308,15 +292,14 @@ async def setmsglimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please provide a valid number")
 
 async def setviolationlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set violation threshold"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /setviolationlimit <number> (2-10)")
         return
-    
+
     try:
         limit = int(context.args[0])
         if 2 <= limit <= 10:
@@ -324,7 +307,7 @@ async def setviolationlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_data = get_group_data(db, update.effective_chat.id)
             group_data["violation_limit"] = limit
             save_db(db)
-            
+
             await update.message.reply_text(f"✅ Violation limit set to {limit}")
         else:
             await update.message.reply_text("❌ Limit must be between 2 and 10")
@@ -332,79 +315,75 @@ async def setviolationlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please provide a valid number")
 
 async def setviolationwindow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set violation time window"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /setviolationwindow <duration> (e.g., 5m, 10m)")
         return
-    
+
     duration = context.args[0].lower()
     seconds = parse_duration(duration)
-    
+
     if seconds and 60 <= seconds <= 3600:
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         group_data["violation_window"] = seconds
         save_db(db)
-        
+
         await update.message.reply_text(f"✅ Violation window set to {format_duration(seconds)}")
     else:
         await update.message.reply_text("❌ Window must be between 1 minute and 1 hour")
 
 async def setmutetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set mute duration"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /setmutetime <duration> (e.g., 5m, 1h, 3d)")
         return
-    
+
     duration = context.args[0].lower()
     seconds = parse_duration(duration)
-    
+
     if seconds and 300 <= seconds <= 259200:
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         group_data["mute_duration"] = seconds
         save_db(db)
-        
+
         await update.message.reply_text(f"✅ Mute duration set to {format_duration(seconds)}")
     else:
         await update.message.reply_text("❌ Duration must be between 5 minutes and 3 days")
 
 async def checkcount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check member's message count"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /checkcount @username")
         return
-    
-    # Get mentioned user
+
     if update.message.entities:
         for entity in update.message.entities:
             if entity.type == "mention":
-                username = update.message.text[entity.offset:entity.offset+entity.length]
-                # Note: This is simplified. In production, resolve username to user_id
-                await update.message.reply_text(f"⚠️ Username resolution requires database lookup. Use user ID instead: /checkcount 123456789")
+                await update.message.reply_text(
+                    "⚠️ Username resolution requires database lookup. Use user ID instead: /checkcount 123456789"
+                )
                 return
-    
+
     try:
         user_id = int(context.args[0].replace('@', ''))
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         member_data = get_member_data(group_data, user_id)
-        
+
         count = member_data["message_count"]
         limit = group_data["restriction_value"]
-        
+
         await update.message.reply_text(
             f"📊 User {user_id}:\n\n"
             f"Messages: {count}/{limit}\n"
@@ -414,26 +393,23 @@ async def checkcount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID")
 
 async def trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trust a member"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /trust @username or /trust user_id")
         return
-    
-    # Simplified - in production, resolve username to user_id
+
     user_identifier = context.args[0].replace('@', '')
-    
+
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
+
     if user_identifier not in group_data["trusted"]:
         group_data["trusted"].append(user_identifier)
         save_db(db)
-        
-        # Mark member as unrestricted
+
         try:
             user_id = int(user_identifier)
             member_data = get_member_data(group_data, user_id)
@@ -441,31 +417,29 @@ async def trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_db(db)
         except:
             pass
-        
+
         await update.message.reply_text(f"✅ User {user_identifier} is now trusted")
     else:
         await update.message.reply_text(f"⚠️ User {user_identifier} is already trusted")
 
 async def untrust(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove trust from a member"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /untrust @username or /untrust user_id")
         return
-    
+
     user_identifier = context.args[0].replace('@', '')
-    
+
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
+
     if user_identifier in group_data["trusted"]:
         group_data["trusted"].remove(user_identifier)
         save_db(db)
-        
-        # Mark member as restricted
+
         try:
             user_id = int(user_identifier)
             member_data = get_member_data(group_data, user_id)
@@ -473,20 +447,19 @@ async def untrust(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_db(db)
         except:
             pass
-        
+
         await update.message.reply_text(f"✅ User {user_identifier} is no longer trusted")
     else:
         await update.message.reply_text(f"⚠️ User {user_identifier} is not trusted")
 
 async def trusted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List trusted members"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
+
     if group_data["trusted"]:
         await update.message.reply_text(
             f"👥 Trusted Members ({len(group_data['trusted'])}):\n\n" +
@@ -496,14 +469,13 @@ async def trusted(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No trusted members")
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View bot settings"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
+
     await update.message.reply_text(
         f"⚙️ Bot Settings:\n\n"
         f"📌 Restriction Mode: {group_data['restriction_mode']}\n"
@@ -516,17 +488,16 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def reset_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset member's message count"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /reset @username or /reset user_id")
         return
-    
+
     user_identifier = context.args[0].replace('@', '')
-    
+
     try:
         user_id = int(user_identifier)
         db = load_db()
@@ -534,25 +505,23 @@ async def reset_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         member_data = get_member_data(group_data, user_id)
         member_data["message_count"] = 0
         save_db(db)
-        
+
         await update.message.reply_text(f"✅ Reset message count for user {user_id}")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
 
 async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unmute a user"""
     if not await is_admin(update):
         await update.message.reply_text("❌ You are not an admin.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Usage: /unmute user_id")
         return
-    
+
     try:
         user_id = int(context.args[0])
-        
-        # Unmute via Telegram API
+
         permissions = ChatPermissions(
             can_send_messages=True,
             can_send_audios=True,
@@ -568,20 +537,19 @@ async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_invite_users=True,
             can_pin_messages=False,
         )
-        
+
         await context.application.bot.restrict_chat_member(
             chat_id=update.effective_chat.id,
             user_id=user_id,
             permissions=permissions
         )
-        
-        # Clear mute status in database
+
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         member_data = get_member_data(group_data, user_id)
         member_data["mute_until"] = None
         save_db(db)
-        
+
         await update.message.reply_text(f"✅ Unmuted user {user_id}")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID")
@@ -590,29 +558,24 @@ async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== MESSAGE HANDLER ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all messages - count text, delete/restrict media"""
     if not update.message or not update.effective_chat:
         return
-    
+
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    
-    # Skip admins
+
     if await is_admin(update):
         return
-    
+
     db = load_db()
     group_data = get_group_data(db, chat_id)
     member_data = get_member_data(group_data, user_id)
-    
-    # Check if trusted
+
     if await is_trusted(group_data, user_id):
         return
-    
-    # Check if muted
+
     is_restricted_now, restriction_type = await is_restricted(update, group_data, member_data)
-    
-    # Check if message is restricted content (sticker, GIF, media)
+
     is_restricted_content = (
         update.message.sticker or
         update.message.animation or
@@ -622,26 +585,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.message.document or
         update.message.voice
     )
-    
-    # If restricted content from restricted user
+
     if is_restricted_content and is_restricted_now:
-        # Delete the message
         await delete_message(context.application, chat_id, update.message.message_id)
-        
-        # Add violation
+
         now = datetime.now()
         member_data["violations"].append(now.isoformat())
-        
-        # Clean old violations outside window
+
         window_start = now - timedelta(seconds=group_data["violation_window"])
         member_data["violations"] = [
             v for v in member_data["violations"]
             if datetime.fromisoformat(v) > window_start
         ]
-        
-        # Check if exceeded violation limit
+
         if len(member_data["violations"]) >= group_data["violation_limit"]:
-            # Mute the user
             mute_until = await mute_user(
                 context.application,
                 chat_id,
@@ -662,85 +619,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             save_db(db)
-            
-            # Show warning with progress
-            # Show warning with progress
-if group_data["restriction_mode"] == "message":
-    limit = group_data["restriction_value"]
-    count = member_data["message_count"]
-    remaining = max(0, limit - count)
 
-    await update.message.reply_text(
-        "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
-        f"📊 You have sent {count}/{limit} messages.\n"
-        f"📍 {remaining} messages remaining.\n\n"
-        f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
-        f"(in {format_duration(group_data['violation_window'])})"
-    )
-else:
-    await update.message.reply_text(
-        "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
-        f"⏳ You must wait {group_data['restriction_value']} after joining.\n\n"
-        f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
-        f"(in {format_duration(group_data['violation_window'])})"
-    )
+            if group_data["restriction_mode"] == "message":
+                limit = group_data["restriction_value"]
+                count = member_data["message_count"]
+                remaining = max(0, limit - count)
+
+                await update.message.reply_text(
+                    "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
+                    f"📊 You have sent {count}/{limit} messages.\n"
+                    f"📍 {remaining} messages remaining.\n\n"
+                    f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
+                    f"(in {format_duration(group_data['violation_window'])})"
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Stickers, GIFs and media are not allowed until you unlock.\n\n"
+                    f"⏳ You must wait {group_data['restriction_value']} after joining.\n\n"
+                    f"⚠️ Violation {len(member_data['violations'])}/{group_data['violation_limit']} "
+                    f"(in {format_duration(group_data['violation_window'])})"
+                )
         return
-    
-    # If text message from restricted user (count it)
+
     if update.message.text and is_restricted_now and restriction_type == "message":
         member_data["message_count"] += 1
         save_db(db)
-        
-        # Check if just reached limit
+
         if member_data["message_count"] == group_data["restriction_value"]:
             await update.message.reply_text(
                 "🎉 Congratulations!\n\n"
                 f"You have sent {group_data['restriction_value']} messages.\n"
                 "You can now send stickers and GIFs! ✅"
             )
-    
-    # If text message from unrestricted user (still count for stats)
+
     if update.message.text and not is_restricted_now:
         member_data["message_count"] += 1
         save_db(db)
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle new members joining"""
     if not update.message or not update.message.new_chat_members:
         return
-    
+
     for new_member in update.message.new_chat_members:
-        # Skip bots
         if new_member.is_bot:
             continue
-        
+
         db = load_db()
         group_data = get_group_data(db, update.effective_chat.id)
         member_data = get_member_data(group_data, new_member.id)
-        
-        # Reset join time
+
         member_data["join_time"] = datetime.now().isoformat()
         member_data["message_count"] = 0
         member_data["violations"] = []
         save_db(db)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
     print(f"Error: {context.error}")
 
 # ==================== MAIN FUNCTION ====================
 def main():
-    """Start the bot"""
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add command handlers
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mycount", mycount))
     application.add_handler(CommandHandler("rules", rules))
-    
-    # Admin commands
+
     application.add_handler(CommandHandler("setrestriction", setrestriction))
     application.add_handler(CommandHandler("setmsglimit", setmsglimit))
     application.add_handler(CommandHandler("setviolationlimit", setviolationlimit))
@@ -753,17 +697,11 @@ def main():
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("reset", reset_count))
     application.add_handler(CommandHandler("unmute", unmute))
-    
-    # Message handler (must be last)
+
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    
-    # New member handler
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member))
-    
-    # Error handler
     application.add_error_handler(error_handler)
-    
-    # Start polling
+
     print("🤖 Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
