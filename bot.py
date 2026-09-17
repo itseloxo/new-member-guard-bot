@@ -243,17 +243,20 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show group rules"""
     db = load_db()
     group_data = get_group_data(db, update.effective_chat.id)
-    
-    await update.message.reply_text(
-        "📜 Group Rules:\n\n"
-        "1️⃣ New members cannot send stickers, GIFs, or media until they prove they're real users.\n\n"
-        "2️⃣ You must either:\n"
-        f"   • Send {group_data['restriction_value']} text messages, OR\n"
-        f"   • Wait {group_data['restriction_value']} after joining\n\n"
-        "3️⃣ Sending {group_data['violation_limit']}+ restricted messages in {format_duration(group_data['violation_window'])} will get you muted for {format_duration(group_data['mute_duration'])}.\n\n"
-        "4️⃣ Be respectful and follow Telegram's Terms of Service."
+
+    mode_text = (
+        "Wait {val} after joining.".format(val=group_data['restriction_value'])
+        if group_data['restriction_mode'] == 'time'
+        else "Send {val} text messages.".format(val=group_data['restriction_value'])
     )
 
+    await update.message.reply_text(
+        "📜 Group Rules\n\n"
+        "1️⃣ New members cannot send stickers, GIFs, or media until they unlock.\n"
+        "2️⃣ To unlock, you must: " + mode_text + "\n"
+        "3️⃣ Sending too many restricted messages quickly will get you muted.\n"
+        "4️⃣ Be respectful and follow Telegram's Terms of Service."
+    )
 # ==================== ADMIN COMMANDS ====================
 async def setrestriction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set time-based restriction"""
