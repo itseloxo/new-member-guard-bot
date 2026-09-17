@@ -640,14 +640,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         
         # Check if exceeded violation limit
+        if len(member_data["violations"]) >= group_data["violation_limit"]:
+            # Mute the user
+            mute_until = await mute_user(
+                context.application,
+                chat_id,
+                user_id,
+                group_data["mute_duration"]
+            )
+            member_data["mute_until"] = mute_until.isoformat()
+            member_data["violations"] = []
+            save_db(db)
+
             await update.message.reply_text(
-        "🚫 You have been temporarily muted.\n\n"
-        f"Duration: {format_duration(group_data['mute_duration'])}\n"
-        f"Reason: You sent {len(member_data['violations']) + 1} restricted messages (stickers/GIFs/media) "
-        f"in {format_duration(group_data['violation_window'])}.\n"
-        f"Rule: Maximum allowed is {group_data['violation_limit'] - 1} such messages in that time.\n\n"
-        "Please wait until the mute expires."
-    )
+                "🚫 You have been temporarily muted.\n\n"
+                f"Duration: {format_duration(group_data['mute_duration'])}\n"
+                f"Reason: You sent {len(member_data['violations']) + 1} restricted messages (stickers/GIFs/media) "
+                f"in {format_duration(group_data['violation_window'])}.\n"
+                f"Rule: Maximum allowed is {group_data['violation_limit'] - 1} such messages in that time.\n\n"
+                "Please wait until the mute expires."
+            )
         else:
             save_db(db)
             
