@@ -35,7 +35,7 @@ from telegram.ext import (
 )
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8621256430:AAG53niJ-VJXyjod5OQauncJDbtYP_1Ilpk")
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "database.sqlite3"))
 LEGACY_DATABASE_PATH = Path(os.environ.get("LEGACY_DATABASE_PATH", "database.json"))
 LOGGER = logging.getLogger("new_member_guard")
