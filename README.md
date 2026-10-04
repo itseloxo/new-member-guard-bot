@@ -44,7 +44,27 @@ such as `1d12h`. A username can be resolved after the bot has observed that
 member in the group; replying to the member or using their numeric user ID also
 works.
 
-Warnings are automatically deleted after the configured time. The bot counts
-ordinary text messages, deletes restricted stickers/GIFs, and mutes a member
-when they reach the configured violation threshold within the configured
-window.
+## Message cleanup and task progress
+
+Bot messages are scheduled for deletion after 60 seconds by default. The
+schedule (chat ID, message ID, and delete timestamp) is stored in SQLite and
+restored when the bot starts, so a Railway restart does not lose pending
+deletions. `/warntime 30s` changes the lifetime of sticker/GIF warnings. Rules
+messages are deliberately permanent; callers can also request a custom lifetime
+or `None` (keep forever) through `send_message_with_auto_delete` in `bot.py`.
+
+Each member's sticker/GIF unlock is stored as a `user_tasks` row, scoped to the
+group, member, and task ID `message_unlock`. Its count stops at the required
+limit, and its completed flag prevents any later update from repeating the task
+or changing that count. Lowering the group's limit completes members who have
+already reached the new limit; completed tasks stay completed if the owner
+later raises it. A new join starts a fresh unlock task.
+
+Message copy, formatting, and emojis live in `format_welcome_message`,
+`format_task_message`, and `format_completion_message` in `bot.py`. Update these
+helpers to change the bot's tone and design. Handler replies use the shared
+auto-delete sender so message cleanup stays consistent.
+
+The bot counts ordinary text messages only, deletes restricted stickers/GIFs,
+and mutes a member when they reach the configured violation threshold within
+the configured window.

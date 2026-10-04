@@ -1,9 +1,10 @@
 import json
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot
 
@@ -73,19 +74,114 @@ class BotStorageTests(unittest.TestCase):
         self.assertEqual(first[1], 1)
         self.assertEqual(second[1], 2)
 
+    def test_completed_message_task_stops_counting_and_is_not_repeated(self):
+        bot.set_group_settings(-1005, {"message_limit": 2})
+
+        self.assertEqual(bot.record_text_message(-1005, 9, "member", "Member"), 1)
+        self.assertFalse(bot.is_task_completed(-1005, 9, bot.MESSAGE_UNLOCK_TASK))
+        self.assertEqual(bot.record_text_message(-1005, 9, "member", "Member"), 2)
+        self.assertTrue(bot.is_task_completed(-1005, 9, bot.MESSAGE_UNLOCK_TASK))
+        self.assertEqual(bot.record_text_message(-1005, 9, "member", "Member"), 2)
+        self.assertEqual(bot.get_task_progress(-1005, 9)["count"], 2)
+
+    def test_lowering_limit_completes_members_who_reached_it(self):
+        bot.set_group_settings(-1006, {"message_limit": 50})
+        bot.record_text_message(-1006, 10, "member", "Member")
+        bot.record_text_message(-1006, 10, "member", "Member")
+
+        bot.set_group_settings(-1006, {"message_limit": 2})
+
+        self.assertTrue(bot.is_task_completed(-1006, 10, bot.MESSAGE_UNLOCK_TASK))
+
+    def test_existing_member_progress_is_backfilled_on_restart(self):
+        bot.set_group_settings(-1009, {"message_limit": 2})
+        bot.cache_member_identity(-1009, 11, "member", "Member")
+        with closing(bot.connect_database()) as connection, connection:
+            connection.execute(
+                "UPDATE members SET message_count = 2 WHERE chat_id = ? AND user_id = ?",
+                (-1009, 11),
+            )
+
+        bot.init_database()
+
+        self.assertTrue(bot.is_task_completed(-1009, 11, bot.MESSAGE_UNLOCK_TASK))
+        self.assertEqual(bot.get_task_progress(-1009, 11)["count"], 2)
+
     def test_trusted_members_do_not_accumulate_violations(self):
         bot.set_member_trusted(-1003, 8, True)
         self.assertIsNone(bot.record_violation(-1003, 8, "trusted", "Trusted"))
 
-    def test_warning_deletion_schedule_is_persistent(self):
-        bot.save_pending_warning(-1004, 31, 12345.0)
+    def test_message_deletion_schedule_is_persistent(self):
+        bot.save_pending_deletion(-1004, 31, 12345.0)
 
         self.assertEqual(
-            bot.get_pending_warnings(),
+            bot.get_pending_deletions(),
             [{"chat_id": -1004, "message_id": 31, "delete_at": 12345.0}],
         )
-        bot.clear_pending_warning(-1004, 31)
-        self.assertEqual(bot.get_pending_warnings(), [])
+        bot.clear_pending_deletion(-1004, 31)
+        self.assertEqual(bot.get_pending_deletions(), [])
+
+    def test_old_warning_schedules_are_migrated(self):
+        with closing(bot.connect_database()) as connection, connection:
+            connection.execute(
+                """
+                CREATE TABLE pending_warnings (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    delete_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO pending_warnings VALUES (?, ?, ?)",
+                (-1010, 32, 12346.0),
+            )
+
+        bot.init_database()
+
+        self.assertEqual(
+            bot.get_pending_deletions(),
+            [{"chat_id": -1010, "message_id": 32, "delete_at": 12346.0}],
+        )
+
+
+class AutoDeleteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_helper_schedules_default_lifetime(self):
+        sender = AsyncMock(return_value=SimpleNamespace(chat_id=-1007, message_id=44))
+        job_queue = MagicMock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot=SimpleNamespace(send_message=sender)),
+            job_queue=job_queue,
+        )
+
+        with patch.object(bot, "time") as mock_time, patch.object(
+            bot, "save_pending_deletion"
+        ) as save_schedule:
+            mock_time.time.return_value = 1000.0
+            sent = await bot.send_message_with_auto_delete(context, -1007, "hello")
+
+        self.assertEqual(sent.message_id, 44)
+        sender.assert_awaited_once_with(chat_id=-1007, text="hello")
+        job_queue.run_once.assert_called_once()
+        self.assertEqual(job_queue.run_once.call_args.kwargs["data"]["message_id"], 44)
+        self.assertEqual(save_schedule.call_args.args[2], 1060.0)
+        self.assertEqual(job_queue.run_once.call_args.kwargs["when"], 60.0)
+
+    async def test_send_helper_can_keep_permanent_messages(self):
+        sender = AsyncMock(return_value=SimpleNamespace(chat_id=-1008, message_id=45))
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot=SimpleNamespace(send_message=sender)),
+            job_queue=None,
+        )
+
+        with patch.object(bot, "save_pending_deletion") as save_schedule:
+            await bot.send_message_with_auto_delete(
+                context, -1008, "rules", delete_after_seconds=None
+            )
+
+        sender.assert_awaited_once_with(chat_id=-1008, text="rules")
+        save_schedule.assert_not_called()
 
 
 class DurationTests(unittest.TestCase):
