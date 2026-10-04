@@ -315,6 +315,24 @@ class CountButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("guard_count", [button.callback_data for button in buttons])
         self.assertIn('<a href="tg://user?id=43">Count User</a>', reply.call_args.args[2])
 
+    async def test_count_command_hides_rules_button_after_task_completion(self):
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1003, type="supergroup"),
+            effective_user=SimpleNamespace(id=43, full_name="Count User"),
+            effective_message=SimpleNamespace(message_id=18),
+        )
+        reply = AsyncMock()
+        with patch.object(bot, "send_reply", new=reply), patch.object(
+            bot,
+            "get_member_record",
+            return_value={"message_count": 50, "task_completed": 1},
+        ), patch.object(
+            bot, "get_group_settings", return_value={"message_limit": 50}
+        ):
+            await bot.count(update, SimpleNamespace())
+
+        self.assertIsNone(reply.call_args.kwargs["reply_markup"])
+
 
 class DurationTests(unittest.TestCase):
     def test_parses_supported_duration_formats(self):
