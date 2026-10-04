@@ -240,6 +240,11 @@ class MessageFormattingTests(unittest.TestCase):
         self.assertIn('<a href="tg://user?id=42">A &lt;Member&gt;</a>', message)
         self.assertIn("✅ Stickers and GIFs are now unlocked.", message)
 
+    def test_progress_message_mentions_member(self):
+        message = bot.format_member_task_message(42, "A <Member>", 12, 50, False)
+        self.assertIn('<a href="tg://user?id=42">A &lt;Member&gt;</a>', message)
+        self.assertIn("12 / 50", message)
+
     def test_warning_count_button_uses_count_callback(self):
         button = bot.count_button_markup().inline_keyboard[0][0]
         self.assertEqual(button.text, "📊 Check my count")
@@ -248,7 +253,7 @@ class MessageFormattingTests(unittest.TestCase):
 
 class CountButtonTests(unittest.IsolatedAsyncioTestCase):
     async def test_count_button_sends_clicking_member_their_progress(self):
-        user = SimpleNamespace(id=42)
+        user = SimpleNamespace(id=42, full_name="Count Clicker")
         message = SimpleNamespace(chat_id=-1001)
         query = SimpleNamespace(
             message=message,
@@ -285,7 +290,30 @@ class CountButtonTests(unittest.IsolatedAsyncioTestCase):
         query.answer.assert_awaited_once_with()
         sender.assert_awaited_once()
         self.assertIn("12 / 50", sender.call_args.kwargs["text"])
+        self.assertIn('<a href="tg://user?id=42">Count Clicker</a>', sender.call_args.kwargs["text"])
         self.assertEqual(sender.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "guard_rules")
+
+    async def test_count_command_keeps_rules_button_but_not_count_button(self):
+        user = SimpleNamespace(id=43, full_name="Count User")
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1003, type="supergroup"),
+            effective_user=user,
+            effective_message=SimpleNamespace(message_id=17),
+        )
+        context = SimpleNamespace()
+        reply = AsyncMock()
+        with patch.object(bot, "send_reply", new=reply), patch.object(
+            bot, "get_member_record", return_value={"message_count": 8, "task_completed": 0}
+        ), patch.object(
+            bot, "get_group_settings", return_value={"message_limit": 50}
+        ):
+            await bot.count(update, context)
+
+        reply_markup = reply.call_args.kwargs["reply_markup"]
+        buttons = [button for row in reply_markup.inline_keyboard for button in row]
+        self.assertEqual([button.callback_data for button in buttons], ["guard_rules"])
+        self.assertNotIn("guard_count", [button.callback_data for button in buttons])
+        self.assertIn('<a href="tg://user?id=43">Count User</a>', reply.call_args.args[2])
 
 
 class DurationTests(unittest.TestCase):
