@@ -871,8 +871,12 @@ async def count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             completed,
         ),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")]]
+        reply_markup=(
+            None
+            if completed
+            else InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")]]
+            )
         ),
     )
 
