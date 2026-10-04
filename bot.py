@@ -85,7 +85,7 @@ MAX_WINDOW_SECONDS = MAX_MUTE_SECONDS
 def claim_interaction_cooldown(
     chat_id: int, user_id: int, scope: str = "commands"
 ) -> bool:
-    """Allow one command per user and chat per minute without posting a cooldown notice."""
+    """Allow one interaction per member and chat per minute."""
     now = time.monotonic()
     key = (chat_id, user_id, scope)
     if _INTERACTION_COOLDOWNS.get(key, 0) > now:
@@ -102,6 +102,18 @@ def claim_interaction_cooldown(
     return True
 
 
+async def allow_group_interaction(
+    update: Update, scope: str = "commands"
+) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None or not is_group_chat(update):
+        return True
+    if await is_admin(update):
+        return True
+    return claim_interaction_cooldown(chat.id, user.id, scope)
+
+
 def with_command_cooldown(
     callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
 ) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
@@ -109,11 +121,8 @@ def with_command_cooldown(
     async def wrapped(
         update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        chat = update.effective_chat
-        user = update.effective_user
-        if chat is not None and user is not None:
-            if not claim_interaction_cooldown(chat.id, user.id):
-                return
+        if not await allow_group_interaction(update):
+            return
         await callback(update, context)
 
     return wrapped
@@ -853,9 +862,7 @@ async def show_rules_callback(
     query = update.callback_query
     if query is None or query.message is None:
         return
-    if not claim_interaction_cooldown(
-        query.message.chat_id, query.from_user.id, "rules_button"
-    ):
+    if not await allow_group_interaction(update, "rules_button"):
         await query.answer("Please wait a minute before opening the rules again.")
         return
     await query.answer()

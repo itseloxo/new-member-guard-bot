@@ -175,7 +175,7 @@ class CommandCooldownTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_commands_share_one_minute_user_cooldown(self):
         update = SimpleNamespace(
-            effective_chat=SimpleNamespace(id=-1001),
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
             effective_user=SimpleNamespace(id=42),
         )
         context = SimpleNamespace()
@@ -184,13 +184,30 @@ class CommandCooldownTests(unittest.IsolatedAsyncioTestCase):
         wrapped_first = bot.with_command_cooldown(first_command)
         wrapped_second = bot.with_command_cooldown(second_command)
 
-        with patch.object(bot.time, "monotonic", side_effect=(100.0, 101.0, 160.0)):
+        with patch.object(bot, "is_admin", new=AsyncMock(return_value=False)), patch.object(
+            bot.time, "monotonic", side_effect=(100.0, 101.0, 160.0)
+        ):
             await wrapped_first(update, context)
             await wrapped_second(update, context)
             await wrapped_second(update, context)
 
         first_command.assert_awaited_once_with(update, context)
         second_command.assert_awaited_once_with(update, context)
+
+    async def test_admin_commands_bypass_the_cooldown(self):
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_user=SimpleNamespace(id=7),
+        )
+        context = SimpleNamespace()
+        command = AsyncMock()
+        wrapped = bot.with_command_cooldown(command)
+
+        with patch.object(bot, "is_admin", new=AsyncMock(return_value=True)):
+            await wrapped(update, context)
+            await wrapped(update, context)
+
+        self.assertEqual(command.await_count, 2)
 
     def test_rules_button_has_a_separate_cooldown_scope(self):
         with patch.object(bot.time, "monotonic", side_effect=(100.0, 100.0, 101.0)):
