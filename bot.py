@@ -761,6 +761,15 @@ def format_task_message(count: int, limit: int, completed: bool) -> str:
     )
 
 
+def format_member_task_message(
+    user_id: int, full_name: str, count: int, limit: int, completed: bool
+) -> str:
+    return (
+        f'👤 <a href="tg://user?id={user_id}">{escape(full_name)}</a>\n\n'
+        f"{format_task_message(count, limit, completed)}"
+    )
+
+
 def format_completion_message(limit: int, user_id: int, full_name: str) -> str:
     return (
         f'✨ <b>UNLOCK COMPLETE</b> ✨\n👤 <a href="tg://user?id={user_id}">{escape(full_name)}</a>\n'
@@ -854,13 +863,16 @@ async def count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_reply(
         update,
         context,
-        format_task_message(message_count, settings["message_limit"], completed),
+        format_member_task_message(
+            update.effective_user.id,
+            update.effective_user.full_name,
+            message_count,
+            settings["message_limit"],
+            completed,
+        ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")],
-                [InlineKeyboardButton("📊 Check my count", callback_data="guard_count")],
-            ]
+            [[InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")]]
         ),
     )
 
@@ -884,7 +896,13 @@ async def show_count_callback(
     await send_message_with_auto_delete(
         context,
         chat_id,
-        format_task_message(message_count, settings["message_limit"], completed),
+        format_member_task_message(
+            user.id,
+            user.full_name,
+            message_count,
+            settings["message_limit"],
+            completed,
+        ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")]]
