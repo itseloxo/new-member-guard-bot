@@ -51,7 +51,9 @@ timestamp) is stored in SQLite and restored when the bot starts, so a Railway
 restart does not lose pending deletions. Commands are limited to one per member
 per group each minute; repeated commands are silently ignored so the bot does
 not add more messages to a busy chat. The rules button has its own one-minute
-cooldown.
+cooldown. Admins can use commands and buttons without the cooldown. Warning
+messages include a **Check my count** button, and task completion messages
+mention the member who reached the goal.
 
 Each member's sticker/GIF unlock is stored as a `user_tasks` row, scoped to the
 group, member, and task ID `message_unlock`. Its count stops at the required
