@@ -168,20 +168,55 @@ class AutoDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(save_schedule.call_args.args[2], 1060.0)
         self.assertEqual(job_queue.run_once.call_args.kwargs["when"], 60.0)
 
-    async def test_send_helper_can_keep_permanent_messages(self):
-        sender = AsyncMock(return_value=SimpleNamespace(chat_id=-1008, message_id=45))
-        context = SimpleNamespace(
-            application=SimpleNamespace(bot=SimpleNamespace(send_message=sender)),
-            job_queue=None,
-        )
 
-        with patch.object(bot, "save_pending_deletion") as save_schedule:
-            await bot.send_message_with_auto_delete(
-                context, -1008, "rules", delete_after_seconds=None
+class CommandCooldownTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        bot._INTERACTION_COOLDOWNS.clear()
+
+    async def test_commands_share_one_minute_user_cooldown(self):
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-1001),
+            effective_user=SimpleNamespace(id=42),
+        )
+        context = SimpleNamespace()
+        first_command = AsyncMock()
+        second_command = AsyncMock()
+        wrapped_first = bot.with_command_cooldown(first_command)
+        wrapped_second = bot.with_command_cooldown(second_command)
+
+        with patch.object(bot.time, "monotonic", side_effect=(100.0, 101.0, 160.0)):
+            await wrapped_first(update, context)
+            await wrapped_second(update, context)
+            await wrapped_second(update, context)
+
+        first_command.assert_awaited_once_with(update, context)
+        second_command.assert_awaited_once_with(update, context)
+
+    def test_rules_button_has_a_separate_cooldown_scope(self):
+        with patch.object(bot.time, "monotonic", side_effect=(100.0, 100.0, 101.0)):
+            self.assertTrue(bot.claim_interaction_cooldown(-1002, 43))
+            self.assertTrue(
+                bot.claim_interaction_cooldown(-1002, 43, "rules_button")
+            )
+            self.assertFalse(
+                bot.claim_interaction_cooldown(-1002, 43, "rules_button")
             )
 
-        sender.assert_awaited_once_with(chat_id=-1008, text="rules")
-        save_schedule.assert_not_called()
+
+class MessageFormattingTests(unittest.TestCase):
+    def test_task_status_has_html_styling_and_progress_bar(self):
+        status = bot.format_task_message(25, 50, False)
+        self.assertIn("<b>YOUR STICKER &amp; GIF PASS</b>", status)
+        self.assertIn("🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜", status)
+        self.assertIn("<b>50%</b>", status)
+
+    def test_rules_include_the_group_settings_in_styled_sections(self):
+        rules = bot.format_rules_message(
+            {"message_limit": 50, "violation_limit": 3, "violation_window": 300, "mute_duration": 600}
+        )
+        self.assertIn("<b>GROUP RULES</b>", rules)
+        self.assertIn("<b>50</b> text messages", rules)
+        self.assertIn("<b>10m</b> mute", rules)
 
 
 class DurationTests(unittest.TestCase):

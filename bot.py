@@ -9,9 +9,10 @@ import sys
 import time
 from contextlib import closing
 from datetime import datetime, timezone
+from functools import wraps
 from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from telegram import (
     BotCommand,
@@ -49,10 +50,11 @@ DEFAULT_SETTINGS = {
     "violation_limit": 3,
     "violation_window": 300,
     "mute_duration": 3600,
-    "warning_duration": 60,
 }
 DEFAULT_MESSAGE_LIFETIME = 60
+COMMAND_COOLDOWN_SECONDS = 60
 MESSAGE_UNLOCK_TASK = "message_unlock"
+_INTERACTION_COOLDOWNS: dict[tuple[int, int, str], float] = {}
 
 MEMBER_COMMANDS = [
     BotCommand("start", "Start the bot"),
@@ -68,7 +70,6 @@ ADMIN_COMMANDS = MEMBER_COMMANDS + [
     BotCommand("violations", "Set violations before mute (2-6)"),
     BotCommand("window", "Set the violation window"),
     BotCommand("mutetime", "Set the mute duration"),
-    BotCommand("warntime", "Set warning auto-delete time"),
     BotCommand("settings", "View this group's guard settings"),
 ]
 OWNER_COMMANDS = ADMIN_COMMANDS + [
@@ -79,7 +80,43 @@ DURATION_PATTERN = re.compile(r"(\d+)([smhdw])", re.IGNORECASE)
 MIN_MUTE_SECONDS = 5
 MAX_MUTE_SECONDS = 7 * 24 * 60 * 60
 MAX_WINDOW_SECONDS = MAX_MUTE_SECONDS
-MAX_WARNING_SECONDS = 24 * 60 * 60
+
+
+def claim_interaction_cooldown(
+    chat_id: int, user_id: int, scope: str = "commands"
+) -> bool:
+    """Allow one command per user and chat per minute without posting a cooldown notice."""
+    now = time.monotonic()
+    key = (chat_id, user_id, scope)
+    if _INTERACTION_COOLDOWNS.get(key, 0) > now:
+        return False
+    if len(_INTERACTION_COOLDOWNS) > 1024:
+        expired = [
+            old_key
+            for old_key, expires_at in _INTERACTION_COOLDOWNS.items()
+            if expires_at <= now
+        ]
+        for old_key in expired:
+            del _INTERACTION_COOLDOWNS[old_key]
+    _INTERACTION_COOLDOWNS[key] = now + COMMAND_COOLDOWN_SECONDS
+    return True
+
+
+def with_command_cooldown(
+    callback: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]],
+) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]:
+    @wraps(callback)
+    async def wrapped(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is not None and user is not None:
+            if not claim_interaction_cooldown(chat.id, user.id):
+                return
+        await callback(update, context)
+
+    return wrapped
 
 
 # Database and task progress
@@ -622,7 +659,6 @@ async def send_reply(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     parse_mode: str | None = None,
-    delete_after_seconds: int | None = DEFAULT_MESSAGE_LIFETIME,
     **kwargs: Any,
 ) -> None:
     message = update.effective_message
@@ -635,7 +671,6 @@ async def send_reply(
         context,
         chat.id,
         text,
-        delete_after_seconds=delete_after_seconds,
         parse_mode=parse_mode,
         **kwargs,
     )
@@ -645,26 +680,22 @@ async def send_message_with_auto_delete(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     text: str,
-    delete_after_seconds: int | None = DEFAULT_MESSAGE_LIFETIME,
     **kwargs: Any,
 ) -> Message:
-    """Send a bot message and persist its deletion time; None means keep it."""
-    if delete_after_seconds is not None and delete_after_seconds <= 0:
-        raise ValueError("delete_after_seconds must be positive or None.")
-    if delete_after_seconds is not None and context.job_queue is None:
+    """Send a bot message and persist its one-minute deletion time."""
+    if context.job_queue is None:
         raise RuntimeError("The Telegram JobQueue is unavailable; install python-telegram-bot[job-queue].")
     sent = await context.application.bot.send_message(
         chat_id=chat_id, text=text, **kwargs
     )
-    if delete_after_seconds is not None:
-        delete_at = time.time() + delete_after_seconds
-        save_pending_deletion(sent.chat_id, sent.message_id, delete_at)
-        context.job_queue.run_once(
-            delete_scheduled_message,
-            when=max(0.1, delete_at - time.time()),
-            data={"chat_id": sent.chat_id, "message_id": sent.message_id},
-            name=f"delete-{sent.chat_id}-{sent.message_id}",
-        )
+    delete_at = time.time() + DEFAULT_MESSAGE_LIFETIME
+    save_pending_deletion(sent.chat_id, sent.message_id, delete_at)
+    context.job_queue.run_once(
+        delete_scheduled_message,
+        when=max(0.1, delete_at - time.time()),
+        data={"chat_id": sent.chat_id, "message_id": sent.message_id},
+        name=f"delete-{sent.chat_id}-{sent.message_id}",
+    )
     return sent
 
 
@@ -700,42 +731,54 @@ async def delete_scheduled_message(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def format_task_message(count: int, limit: int, completed: bool) -> str:
+    percentage = min(100, int(count * 100 / max(1, limit)))
+    filled = percentage // 10
+    progress_bar = "🟩" * filled + "⬜" * (10 - filled)
     if completed:
         return (
-            "🎯 <b>Sticker &amp; GIF unlock</b>\n\n"
-            f"📊 Messages sent: <b>{count} / {limit}</b>\n"
-            "✅ Task completed — stickers and GIFs are unlocked. 🏆"
+            "🏆 <b>STICKER &amp; GIF PASS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"{progress_bar} <b>{percentage}%</b>\n"
+            f"📨 Messages: <b>{count} / {limit}</b>\n\n"
+            "✅ <b>Complete!</b> Stickers and GIFs are unlocked."
         )
     return (
-        "🎯 <b>Sticker &amp; GIF unlock</b>\n\n"
-        f"📊 Messages sent: <b>{count} / {limit}</b>\n"
-        f"⏳ Messages to go: <b>{max(0, limit - count)}</b>\n\n"
-        "💡 Keep chatting with the group to complete your task!"
+        "🎯 <b>YOUR STICKER &amp; GIF PASS</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"{progress_bar} <b>{percentage}%</b>\n"
+        f"📨 Messages: <b>{count} / {limit}</b>\n"
+        f"⏳ To go: <b>{max(0, limit - count)}</b>\n\n"
+        "<i>Keep chatting to unlock stickers and GIFs.</i>"
     )
 
 
 def format_completion_message(limit: int) -> str:
     return (
-        "🏆 <b>Task completed!</b>\n\n"
-        f"You've sent <b>{limit}</b> messages. Stickers and GIFs are now unlocked. ✅"
+        "✨ <b>UNLOCK COMPLETE</b> ✨\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📨 Goal reached: <b>{limit}</b> messages\n"
+        "✅ Stickers and GIFs are now unlocked. 🏆"
     )
 
 
 def format_welcome_message() -> str:
     return (
-        "🛡️ <b>New Member Guard</b>\n\n"
-        "I help keep sticker and GIF spam out of groups.\n"
-        "Add me as an admin with permission to delete messages and restrict members."
+        "🛡️ <b>NEW MEMBER GUARD</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "I help keep sticker and GIF spam under control.\n\n"
+        "<i>Add me as an admin with permission to delete messages and restrict members.</i>"
     )
 
 
 def format_rules_message(settings: dict[str, Any]) -> str:
     return (
-        "📜 <b>Sticker &amp; GIF rules</b>\n\n"
-        f"🎯 Send <b>{settings['message_limit']}</b> text messages to unlock stickers and GIFs.\n"
-        f"⚠️ {settings['violation_limit']} violations within "
+        "📜 <b>GROUP RULES</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 Send <b>{settings['message_limit']}</b> text messages to unlock stickers and GIFs.\n\n"
+        f"⚠️ <b>{settings['violation_limit']}</b> violations within "
         f"{format_duration(settings['violation_window'])} result in a "
-        f"{format_duration(settings['mute_duration'])} mute."
+        f"<b>{format_duration(settings['mute_duration'])}</b> mute.\n\n"
+        "<i>Thanks for helping keep the group welcoming!</i>"
     )
 
 
@@ -754,16 +797,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if await is_admin(update):
         text = (
-            "📋 <b>Member</b>\n"
+            "📋 <b>MEMBER</b>\n"
             "• /count — check your progress\n"
             "• /rules — view sticker &amp; GIF rules\n\n"
-            "🛡️ <b>Admin</b>\n"
+            "🛡️ <b>ADMIN</b>\n"
             "• /check, /trust, /untrust, /trusted\n"
-            "• /violations, /window, /mutetime, /warntime\n"
+            "• /violations, /window, /mutetime\n"
             "• /settings"
         )
         if await is_owner(update.effective_chat, update.effective_user.id):
-            text += "\n\n👑 <b>Owner</b>\n• /limit — set the message goal"
+            text += "\n\n👑 <b>OWNER</b>\n• /limit — set the message goal"
     else:
         text = "📋 <b>Commands</b>\n• /count — check your progress\n• /rules — view group rules"
     await send_reply(update, context, text, parse_mode="HTML")
@@ -779,7 +822,6 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context,
         format_rules_message(settings),
         parse_mode="HTML",
-        delete_after_seconds=None,
     )
 
 
@@ -811,13 +853,17 @@ async def show_rules_callback(
     query = update.callback_query
     if query is None or query.message is None:
         return
+    if not claim_interaction_cooldown(
+        query.message.chat_id, query.from_user.id, "rules_button"
+    ):
+        await query.answer("Please wait a minute before opening the rules again.")
+        return
     await query.answer()
     settings = get_group_settings(query.message.chat_id)
     await send_message_with_auto_delete(
         context,
         query.message.chat_id,
         format_rules_message(settings),
-        delete_after_seconds=None,
         parse_mode="HTML",
     )
 
@@ -1028,18 +1074,6 @@ async def set_mute_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def set_warning_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await set_admin_setting(
-        update,
-        context,
-        "warning_duration",
-        "Warning auto-delete time",
-        MIN_MUTE_SECONDS,
-        MAX_WARNING_SECONDS,
-        duration=True,
-    )
-
-
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await admin_only(update, context):
         return
@@ -1050,7 +1084,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⚠️ Violations before mute: <b>{values['violation_limit']}</b>\n"
         f"⏱️ Violation window: <b>{format_duration(values['violation_window'])}</b>\n"
         f"🔇 Mute duration: <b>{format_duration(values['mute_duration'])}</b>\n"
-        f"🧹 Warning lifetime: <b>{format_duration(values['warning_duration'])}</b>"
+        f"🧹 Bot messages auto-delete after <b>{DEFAULT_MESSAGE_LIFETIME} seconds</b>"
     )
     await send_reply(update, context, text, parse_mode="HTML")
 
@@ -1071,7 +1105,6 @@ async def send_warning(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    duration: int,
 ) -> None:
     user = update.effective_user
     if user is None or update.effective_message is None:
@@ -1081,7 +1114,6 @@ async def send_warning(
         context,
         update.effective_chat.id,
         f"⚠️ {mention}, {text}",
-        delete_after_seconds=duration,
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -1118,7 +1150,6 @@ async def mute_member(
         context,
         f"you've been muted for <b>{format_duration(settings_data['mute_duration'])}</b> "
         f"after {violation_count} sticker/GIF violations. Please follow the group rules.",
-        settings_data["warning_duration"],
     )
 
 
@@ -1162,7 +1193,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Next {remaining} violation(s) within "
                 f"{format_duration(settings_data['violation_window'])} will mute you for "
                 f"{format_duration(settings_data['mute_duration'])}.",
-                settings_data["warning_duration"],
             )
         return
     if message.text and not message.text.startswith("/"):
@@ -1276,21 +1306,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_application(token: str) -> Application:
     application = Application.builder().token(token).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("rules", rules))
-    application.add_handler(CommandHandler("count", count))
-
-    application.add_handler(CommandHandler("check", check))
-    application.add_handler(CommandHandler("trust", trust))
-    application.add_handler(CommandHandler("untrust", untrust))
-    application.add_handler(CommandHandler("trusted", trusted_status))
-    application.add_handler(CommandHandler("limit", set_limit))
-    application.add_handler(CommandHandler("violations", set_violations))
-    application.add_handler(CommandHandler("window", set_window))
-    application.add_handler(CommandHandler("mutetime", set_mute_time))
-    application.add_handler(CommandHandler("warntime", set_warning_time))
-    application.add_handler(CommandHandler("settings", settings))
+    command_handlers = (
+        ("start", start),
+        ("help", help_command),
+        ("rules", rules),
+        ("count", count),
+        ("check", check),
+        ("trust", trust),
+        ("untrust", untrust),
+        ("trusted", trusted_status),
+        ("limit", set_limit),
+        ("violations", set_violations),
+        ("window", set_window),
+        ("mutetime", set_mute_time),
+        ("settings", settings),
+    )
+    for command, callback in command_handlers:
+        application.add_handler(
+            CommandHandler(command, with_command_cooldown(callback))
+        )
     application.add_handler(
         CallbackQueryHandler(show_rules_callback, pattern="^guard_rules$")
     )
