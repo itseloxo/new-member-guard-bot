@@ -20,13 +20,16 @@ from telegram import (
     BotCommandScopeChatMember,
     ChatMember,
     ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
     MessageEntity,
     Update,
 )
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -35,7 +38,8 @@ from telegram.ext import (
 )
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8621256430:AAG53niJ-VJXyjod5OQauncJDbtYP_1Ilpk")
+# Configuration and Telegram command menus
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "database.sqlite3"))
 LEGACY_DATABASE_PATH = Path(os.environ.get("LEGACY_DATABASE_PATH", "database.json"))
 LOGGER = logging.getLogger("new_member_guard")
@@ -45,8 +49,10 @@ DEFAULT_SETTINGS = {
     "violation_limit": 3,
     "violation_window": 300,
     "mute_duration": 3600,
-    "warning_duration": 15,
+    "warning_duration": 60,
 }
+DEFAULT_MESSAGE_LIFETIME = 60
+MESSAGE_UNLOCK_TASK = "message_unlock"
 
 MEMBER_COMMANDS = [
     BotCommand("start", "Start the bot"),
@@ -76,6 +82,7 @@ MAX_WINDOW_SECONDS = MAX_MUTE_SECONDS
 MAX_WARNING_SECONDS = 24 * 60 * 60
 
 
+# Database and task progress
 def connect_database() -> sqlite3.Connection:
     connection = sqlite3.connect(DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
@@ -97,6 +104,7 @@ def init_database() -> None:
                 user_id INTEGER NOT NULL,
                 username TEXT,
                 full_name TEXT NOT NULL DEFAULT '',
+                -- Retained as a migration mirror for older database.json/SQLite data.
                 message_count INTEGER NOT NULL DEFAULT 0,
                 join_time TEXT NOT NULL,
                 violations TEXT NOT NULL DEFAULT '[]',
@@ -104,7 +112,18 @@ def init_database() -> None:
                 mute_until TEXT,
                 PRIMARY KEY (chat_id, user_id)
             );
-            CREATE TABLE IF NOT EXISTS pending_warnings (
+            CREATE TABLE IF NOT EXISTS user_tasks (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                task_id TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                count INTEGER NOT NULL DEFAULT 0,
+                completed_at TEXT,
+                PRIMARY KEY (chat_id, user_id, task_id),
+                FOREIGN KEY (chat_id, user_id)
+                    REFERENCES members(chat_id, user_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS pending_deletions (
                 chat_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 delete_at REAL NOT NULL,
@@ -112,6 +131,9 @@ def init_database() -> None:
             );
             """
         )
+        _migrate_pending_warnings(connection)
+        connection.commit()
+        _backfill_message_tasks(connection)
         connection.commit()
     migrate_legacy_database()
 
@@ -180,7 +202,80 @@ def migrate_legacy_database() -> None:
                     "UPDATE members SET is_trusted = 1 WHERE chat_id = ? AND user_id = ?",
                     (chat_id, user_id),
                 )
+            _backfill_message_tasks(connection, chat_id)
         connection.commit()
+
+
+def _migrate_pending_warnings(connection: sqlite3.Connection) -> None:
+    tables = {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "pending_warnings" not in tables:
+        return
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO pending_deletions(chat_id, message_id, delete_at)
+        SELECT chat_id, message_id, delete_at FROM pending_warnings
+        """
+    )
+    connection.execute("DROP TABLE pending_warnings")
+
+
+def _backfill_message_tasks(
+    connection: sqlite3.Connection, chat_id: int | None = None
+) -> None:
+    query = """
+        SELECT members.chat_id, members.user_id, members.message_count, groups.settings
+        FROM members JOIN groups ON groups.chat_id = members.chat_id
+    """
+    params: tuple[int, ...] = ()
+    if chat_id is not None:
+        query += " WHERE members.chat_id = ?"
+        params = (chat_id,)
+    for member in connection.execute(query, params).fetchall():
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update(json.loads(member["settings"]))
+        _ensure_message_task(connection, member["chat_id"], member["user_id"], settings)
+
+
+def _ensure_message_task(
+    connection: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    settings: dict[str, Any],
+) -> None:
+    if connection.execute(
+        """
+        SELECT 1 FROM user_tasks
+        WHERE chat_id = ? AND user_id = ? AND task_id = ?
+        """,
+        (chat_id, user_id, MESSAGE_UNLOCK_TASK),
+    ).fetchone():
+        return
+    member = connection.execute(
+        "SELECT message_count FROM members WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id),
+    ).fetchone()
+    count = int(member["message_count"]) if member else 0
+    completed = count >= settings["message_limit"]
+    connection.execute(
+        """
+        INSERT INTO user_tasks
+            (chat_id, user_id, task_id, completed, count, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            chat_id,
+            user_id,
+            MESSAGE_UNLOCK_TASK,
+            int(completed),
+            count,
+            datetime.now(timezone.utc).isoformat() if completed else None,
+        ),
+    )
 
 
 def _legacy_int(value: Any, default: int) -> int:
@@ -195,6 +290,7 @@ def _bounded_legacy_int(value: Any, default: int, minimum: int, maximum: int) ->
     return result if minimum <= result <= maximum else default
 
 
+# Shared duration and formatting utilities
 def parse_duration(value: str) -> int | None:
     """Parse a duration such as 30s, 2h, 3d, or 1d12h."""
     value = value.strip().lower()
@@ -253,6 +349,19 @@ def set_group_settings(chat_id: int, updates: dict[str, Any]) -> dict[str, Any]:
                 "UPDATE groups SET settings = ? WHERE chat_id = ?",
                 (json.dumps(settings), chat_id),
             )
+            if "message_limit" in updates:
+                connection.execute(
+                    """
+                    UPDATE user_tasks SET completed = 1, completed_at = ?
+                    WHERE chat_id = ? AND task_id = ? AND completed = 0 AND count >= ?
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        chat_id,
+                        MESSAGE_UNLOCK_TASK,
+                        settings["message_limit"],
+                    ),
+                )
             return settings
 
 
@@ -302,22 +411,93 @@ def record_join(chat_id: int, user_id: int, username: str | None, full_name: str
                 """,
                 (datetime.now(timezone.utc).isoformat(), chat_id, user_id),
             )
+            connection.execute(
+                """
+                INSERT INTO user_tasks(chat_id, user_id, task_id, completed, count)
+                VALUES (?, ?, ?, 0, 0)
+                ON CONFLICT(chat_id, user_id, task_id)
+                DO UPDATE SET completed = 0, count = 0, completed_at = NULL
+                """,
+                (chat_id, user_id, MESSAGE_UNLOCK_TASK),
+            )
 
 
 def record_text_message(chat_id: int, user_id: int, username: str | None, full_name: str) -> int:
     with closing(connect_database()) as connection:
         with connection:
-            _ensure_group(connection, chat_id)
+            settings = _ensure_group(connection, chat_id)
             _ensure_member(connection, chat_id, user_id, username, full_name)
-            connection.execute(
-                "UPDATE members SET message_count = message_count + 1 WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id),
-            )
-            row = connection.execute(
-                "SELECT message_count FROM members WHERE chat_id = ? AND user_id = ?",
-                (chat_id, user_id),
+            _ensure_message_task(connection, chat_id, user_id, settings)
+            if is_task_completed(chat_id, user_id, MESSAGE_UNLOCK_TASK, connection):
+                return get_task_progress(chat_id, user_id, MESSAGE_UNLOCK_TASK, connection)["count"]
+            task = connection.execute(
+                """
+                SELECT count FROM user_tasks
+                WHERE chat_id = ? AND user_id = ? AND task_id = ?
+                """,
+                (chat_id, user_id, MESSAGE_UNLOCK_TASK),
             ).fetchone()
-            return int(row["message_count"])
+            count = min(int(task["count"]) + 1, settings["message_limit"])
+            completed = count >= settings["message_limit"]
+            connection.execute(
+                """
+                UPDATE user_tasks SET count = ?, completed = ?, completed_at = ?
+                WHERE chat_id = ? AND user_id = ? AND task_id = ?
+                """,
+                (
+                    count,
+                    int(completed),
+                    datetime.now(timezone.utc).isoformat() if completed else None,
+                    chat_id,
+                    user_id,
+                    MESSAGE_UNLOCK_TASK,
+                ),
+            )
+            connection.execute(
+                "UPDATE members SET message_count = ? WHERE chat_id = ? AND user_id = ?",
+                (count, chat_id, user_id),
+            )
+            return count
+
+
+def is_task_completed(
+    chat_id: int,
+    user_id: int,
+    task_id: str,
+    connection: sqlite3.Connection | None = None,
+) -> bool:
+    if connection is None:
+        with closing(connect_database()) as db:
+            return is_task_completed(chat_id, user_id, task_id, db)
+    row = connection.execute(
+        """
+        SELECT completed FROM user_tasks
+        WHERE chat_id = ? AND user_id = ? AND task_id = ?
+        """,
+        (chat_id, user_id, task_id),
+    ).fetchone()
+    return bool(row and row["completed"])
+
+
+def get_task_progress(
+    chat_id: int,
+    user_id: int,
+    task_id: str = MESSAGE_UNLOCK_TASK,
+    connection: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if connection is None:
+        with closing(connect_database()) as db:
+            return get_task_progress(chat_id, user_id, task_id, db)
+    row = connection.execute(
+        """
+        SELECT completed, count, completed_at FROM user_tasks
+        WHERE chat_id = ? AND user_id = ? AND task_id = ?
+        """,
+        (chat_id, user_id, task_id),
+    ).fetchone()
+    if row:
+        return dict(row)
+    return {"completed": 0, "count": 0, "completed_at": None}
 
 
 def record_violation(
@@ -333,12 +513,14 @@ def record_violation(
             _ensure_member(connection, chat_id, user_id, username, full_name)
             member = connection.execute(
                 """
-                SELECT message_count, violations, is_trusted
+                SELECT violations, is_trusted
                 FROM members WHERE chat_id = ? AND user_id = ?
                 """,
                 (chat_id, user_id),
             ).fetchone()
-            if member["is_trusted"] or member["message_count"] >= settings["message_limit"]:
+            if member["is_trusted"] or is_task_completed(
+                chat_id, user_id, MESSAGE_UNLOCK_TASK, connection
+            ):
                 return None
             violations = [
                 stamp for stamp in json.loads(member["violations"])
@@ -369,7 +551,13 @@ def get_member_record(chat_id: int, user_id: int) -> dict[str, Any] | None:
             "SELECT * FROM members WHERE chat_id = ? AND user_id = ?",
             (chat_id, user_id),
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        member = dict(row)
+        task = get_task_progress(chat_id, user_id, connection=connection)
+        member["message_count"] = task["count"]
+        member["task_completed"] = bool(task["completed"])
+        return member
 
 
 def find_member_by_username(chat_id: int, username: str) -> dict[str, Any] | None:
@@ -390,28 +578,28 @@ def set_member_mute(chat_id: int, user_id: int, until: datetime) -> None:
             )
 
 
-def save_pending_warning(chat_id: int, message_id: int, delete_at: float) -> None:
+def save_pending_deletion(chat_id: int, message_id: int, delete_at: float) -> None:
     with closing(connect_database()) as connection:
         with connection:
             connection.execute(
-                "INSERT OR REPLACE INTO pending_warnings(chat_id, message_id, delete_at) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO pending_deletions(chat_id, message_id, delete_at) VALUES (?, ?, ?)",
                 (chat_id, message_id, delete_at),
             )
 
 
-def clear_pending_warning(chat_id: int, message_id: int) -> None:
+def clear_pending_deletion(chat_id: int, message_id: int) -> None:
     with closing(connect_database()) as connection:
         with connection:
             connection.execute(
-                "DELETE FROM pending_warnings WHERE chat_id = ? AND message_id = ?",
+                "DELETE FROM pending_deletions WHERE chat_id = ? AND message_id = ?",
                 (chat_id, message_id),
             )
 
 
-def get_pending_warnings() -> list[dict[str, Any]]:
+def get_pending_deletions() -> list[dict[str, Any]]:
     with closing(connect_database()) as connection:
         rows = connection.execute(
-            "SELECT chat_id, message_id, delete_at FROM pending_warnings"
+            "SELECT chat_id, message_id, delete_at FROM pending_deletions"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -428,69 +616,210 @@ async def is_admin(update: Update) -> bool:
     return member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
 
 
+# Shared Telegram message delivery and presentation
 async def send_reply(
-    update: Update, text: str, parse_mode: str | None = None
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    parse_mode: str | None = None,
+    delete_after_seconds: int | None = DEFAULT_MESSAGE_LIFETIME,
+    **kwargs: Any,
 ) -> None:
-    if update.effective_message:
-        await update.effective_message.reply_text(text, parse_mode=parse_mode)
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if message.message_id:
+        kwargs["reply_to_message_id"] = message.message_id
+    await send_message_with_auto_delete(
+        context,
+        chat.id,
+        text,
+        delete_after_seconds=delete_after_seconds,
+        parse_mode=parse_mode,
+        **kwargs,
+    )
+
+
+async def send_message_with_auto_delete(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    delete_after_seconds: int | None = DEFAULT_MESSAGE_LIFETIME,
+    **kwargs: Any,
+) -> Message:
+    """Send a bot message and persist its deletion time; None means keep it."""
+    if delete_after_seconds is not None and delete_after_seconds <= 0:
+        raise ValueError("delete_after_seconds must be positive or None.")
+    if delete_after_seconds is not None and context.job_queue is None:
+        raise RuntimeError("The Telegram JobQueue is unavailable; install python-telegram-bot[job-queue].")
+    sent = await context.application.bot.send_message(
+        chat_id=chat_id, text=text, **kwargs
+    )
+    if delete_after_seconds is not None:
+        delete_at = time.time() + delete_after_seconds
+        save_pending_deletion(sent.chat_id, sent.message_id, delete_at)
+        context.job_queue.run_once(
+            delete_scheduled_message,
+            when=max(0.1, delete_at - time.time()),
+            data={"chat_id": sent.chat_id, "message_id": sent.message_id},
+            name=f"delete-{sent.chat_id}-{sent.message_id}",
+        )
+    return sent
+
+
+async def delete_scheduled_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    if job is None:
+        return
+    chat_id = job.data["chat_id"]
+    message_id = job.data["message_id"]
+    try:
+        await context.application.bot.delete_message(
+            chat_id=chat_id, message_id=message_id
+        )
+    except BadRequest as error:
+        # The message may already have been removed or aged out of Telegram's deletion window.
+        LOGGER.debug("Could not delete scheduled message %s: %s", message_id, error)
+        clear_pending_deletion(chat_id, message_id)
+    except Forbidden:
+        LOGGER.exception("Telegram denied deletion of bot message %s", message_id)
+        clear_pending_deletion(chat_id, message_id)
+    except TelegramError:
+        LOGGER.exception("Temporary failure deleting bot message %s; retrying", message_id)
+        if context.job_queue is None:
+            raise RuntimeError("The Telegram JobQueue is unavailable while retrying message deletion.")
+        context.job_queue.run_once(
+            delete_scheduled_message,
+            when=60,
+            data={"chat_id": chat_id, "message_id": message_id},
+            name=f"delete-{chat_id}-{message_id}",
+        )
+    else:
+        clear_pending_deletion(chat_id, message_id)
+
+
+def format_task_message(count: int, limit: int, completed: bool) -> str:
+    if completed:
+        return (
+            "🎯 <b>Sticker &amp; GIF unlock</b>\n\n"
+            f"📊 Messages sent: <b>{count} / {limit}</b>\n"
+            "✅ Task completed — stickers and GIFs are unlocked. 🏆"
+        )
+    return (
+        "🎯 <b>Sticker &amp; GIF unlock</b>\n\n"
+        f"📊 Messages sent: <b>{count} / {limit}</b>\n"
+        f"⏳ Messages to go: <b>{max(0, limit - count)}</b>\n\n"
+        "💡 Keep chatting with the group to complete your task!"
+    )
+
+
+def format_completion_message(limit: int) -> str:
+    return (
+        "🏆 <b>Task completed!</b>\n\n"
+        f"You've sent <b>{limit}</b> messages. Stickers and GIFs are now unlocked. ✅"
+    )
+
+
+def format_welcome_message() -> str:
+    return (
+        "🛡️ <b>New Member Guard</b>\n\n"
+        "I help keep sticker and GIF spam out of groups.\n"
+        "Add me as an admin with permission to delete messages and restrict members."
+    )
+
+
+def format_rules_message(settings: dict[str, Any]) -> str:
+    return (
+        "📜 <b>Sticker &amp; GIF rules</b>\n\n"
+        f"🎯 Send <b>{settings['message_limit']}</b> text messages to unlock stickers and GIFs.\n"
+        f"⚠️ {settings['violation_limit']} violations within "
+        f"{format_duration(settings['violation_window'])} result in a "
+        f"{format_duration(settings['mute_duration'])} mute."
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_reply(
         update,
-        "Hi! I help keep new-member sticker and GIF spam out of groups. "
-        "Add me as an admin with permission to delete messages and restrict members.",
+        context,
+        format_welcome_message(),
+        parse_mode="HTML",
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_group_chat(update):
-        await send_reply(update, "Use /help in the group you want to check.")
+        await send_reply(update, context, "ℹ️ Use /help in the group you want to check.")
         return
     if await is_admin(update):
         text = (
-            "Member commands: /count, /rules\n"
-            "Admin commands: /check, /trust, /untrust, /trusted, /violations, "
-            "/window, /mutetime, /warntime, /settings"
+            "📋 <b>Member</b>\n"
+            "• /count — check your progress\n"
+            "• /rules — view sticker &amp; GIF rules\n\n"
+            "🛡️ <b>Admin</b>\n"
+            "• /check, /trust, /untrust, /trusted\n"
+            "• /violations, /window, /mutetime, /warntime\n"
+            "• /settings"
         )
         if await is_owner(update.effective_chat, update.effective_user.id):
-            text += "\nOwner command: /limit"
+            text += "\n\n👑 <b>Owner</b>\n• /limit — set the message goal"
     else:
-        text = "Commands: /count, /rules"
-    await send_reply(update, text)
+        text = "📋 <b>Commands</b>\n• /count — check your progress\n• /rules — view group rules"
+    await send_reply(update, context, text, parse_mode="HTML")
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_group_chat(update):
-        await send_reply(update, "Use /rules in the group you want to check.")
+        await send_reply(update, context, "ℹ️ Use /rules in the group you want to check.")
         return
     settings = get_group_settings(update.effective_chat.id)
     await send_reply(
         update,
-        f"📜 Sticker & GIF rules\n\n"
-        f"New members need {settings['message_limit']} text messages before sending stickers or GIFs.\n"
-        f"Sticker/GIF violations are counted over {format_duration(settings['violation_window'])}. "
-        f"After {settings['violation_limit']} violations, the member is muted for "
-        f"{format_duration(settings['mute_duration'])}.",
+        context,
+        format_rules_message(settings),
+        parse_mode="HTML",
+        delete_after_seconds=None,
     )
 
 
 async def count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_group_chat(update):
-        await send_reply(update, "Use /count in the group you want to check.")
+        await send_reply(update, context, "ℹ️ Use /count in the group you want to check.")
         return
     if update.effective_user is None:
-        await send_reply(update, "I couldn't identify your Telegram account.")
+        await send_reply(update, context, "❌ I couldn't identify your Telegram account.")
         return
     member = get_member_record(update.effective_chat.id, update.effective_user.id)
     settings = get_group_settings(update.effective_chat.id)
     message_count = member["message_count"] if member else 0
-    remaining = max(0, settings["message_limit"] - message_count)
-    if remaining:
-        text = f"📊 Your count: {message_count}/{settings['message_limit']} text messages ({remaining} to go)."
-    else:
-        text = f"✅ You have sent {message_count} text messages. Stickers and GIFs are unlocked."
-    await send_reply(update, text)
+    completed = bool(member and member["task_completed"])
+    await send_reply(
+        update,
+        context,
+        format_task_message(message_count, settings["message_limit"], completed),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")]]
+        ),
+    )
+
+
+async def show_rules_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    await query.answer()
+    settings = get_group_settings(query.message.chat_id)
+    await send_message_with_auto_delete(
+        context,
+        query.message.chat_id,
+        format_rules_message(settings),
+        delete_after_seconds=None,
+        parse_mode="HTML",
+    )
 
 
 async def is_owner(chat: Any, user_id: int) -> bool:
@@ -529,58 +858,66 @@ async def check_target_membership(update: Update, user_id: int) -> bool:
     return member.status not in (ChatMember.LEFT, ChatMember.BANNED)
 
 
-async def admin_only(update: Update) -> bool:
+async def admin_only(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
     if not is_group_chat(update):
-        await send_reply(update, "This command only works in a group.")
+        await send_reply(update, context, "❌ This command only works in a group.")
         return False
     if not await is_admin(update):
-        await send_reply(update, "This command is available to group admins only.")
+        await send_reply(update, context, "❌ This command is available to group admins only.")
         return False
     return True
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await admin_only(update):
+    if not await admin_only(update, context):
         return
     user_id, name = await resolve_target(update, context)
     if user_id is None:
-        await send_reply(update, "Reply to a member or use /check @username or /check user_id.")
+        await send_reply(update, context, "❌ Reply to a member or use /check @username or /check user_id.")
         return
     if not await check_target_membership(update, user_id):
-        await send_reply(update, "That user is not a current member of this group.")
+        await send_reply(update, context, "❌ That user is not a current member of this group.")
         return
     member = get_member_record(update.effective_chat.id, user_id)
     settings = get_group_settings(update.effective_chat.id)
     message_count = member["message_count"] if member else 0
     remaining = max(0, settings["message_limit"] - message_count)
     label = escape(name or (member["full_name"] if member else "") or str(user_id))
+    completed = bool(member and member["task_completed"])
     await send_reply(
         update,
-        f"📊 <a href=\"tg://user?id={user_id}\">{label}</a>: "
-        f"{message_count}/{settings['message_limit']} text messages; {remaining} to go.",
+        context,
+        "🎯 <b>Member task status</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={user_id}\">{label}</a>\n"
+        f"📊 Messages: <b>{message_count} / {settings['message_limit']}</b>\n"
+        f"⏳ Remaining: <b>{remaining}</b>\n"
+        f"✅ Completed: <b>{'Yes' if completed else 'No'}</b>",
         parse_mode="HTML",
     )
 
 
 async def set_trusted(update: Update, context: ContextTypes.DEFAULT_TYPE, trusted: bool) -> None:
-    if not await admin_only(update):
+    if not await admin_only(update, context):
         return
     user_id, name = await resolve_target(update, context)
     if user_id is None:
         verb = "trust" if trusted else "untrust"
-        await send_reply(update, f"Reply to a member or use /{verb} @username or user_id.")
+        await send_reply(update, context, f"❌ Reply to a member or use /{verb} @username or user_id.")
         return
     if not await check_target_membership(update, user_id):
-        await send_reply(update, "That user is not a current member of this group.")
+        await send_reply(update, context, "❌ That user is not a current member of this group.")
         return
     set_member_trusted(update.effective_chat.id, user_id, trusted)
     label = escape(name or str(user_id))
     status = "is now trusted" if trusted else "is no longer trusted"
     await send_reply(
-        update, f"✅ <a href=\"tg://user?id={user_id}\">{label}</a> {status}.", parse_mode="HTML"
+        update, context, f"✅ <a href=\"tg://user?id={user_id}\">{label}</a> {status}.", parse_mode="HTML"
     )
 
 
+# Group member and owner commands
 async def trust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await set_trusted(update, context, True)
 
@@ -590,43 +927,48 @@ async def untrust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def trusted_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await admin_only(update):
+    if not await admin_only(update, context):
         return
     user_id, name = await resolve_target(update, context)
     if user_id is None:
-        await send_reply(update, "Reply to a member or use /trusted @username or user_id.")
+        await send_reply(update, context, "❌ Reply to a member or use /trusted @username or user_id.")
         return
     member = get_member_record(update.effective_chat.id, user_id)
     label = escape(name or (member["full_name"] if member else "") or str(user_id))
     state = "trusted ✅" if member and member["is_trusted"] else "not trusted"
     await send_reply(
-        update, f"<a href=\"tg://user?id={user_id}\">{label}</a> is {state}.", parse_mode="HTML"
+        update, context, f"<a href=\"tg://user?id={user_id}\">{label}</a> is {state}.", parse_mode="HTML"
     )
 
 
 async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_group_chat(update):
-        await send_reply(update, "This command only works in a group.")
+        await send_reply(update, context, "❌ This command only works in a group.")
         return
     if update.effective_user is None:
-        await send_reply(update, "Only the group owner can change the message limit.")
+        await send_reply(update, context, "❌ Only the group owner can change the message limit.")
         return
     if not await is_owner(update.effective_chat, update.effective_user.id):
-        await send_reply(update, "Only this group's owner can change the message limit.")
+        await send_reply(update, context, "❌ Only this group's owner can change the message limit.")
         return
     if not context.args:
-        await send_reply(update, "Usage: /limit 500 (choose a number from 50 to 1000).")
+        await send_reply(update, context, "ℹ️ Usage: /limit 500 (choose a number from 50 to 1000).")
         return
     try:
         value = int(context.args[0])
     except ValueError:
-        await send_reply(update, "Enter a whole number from 50 to 1000.")
+        await send_reply(update, context, "❌ Enter a whole number from 50 to 1000.")
         return
     if not 50 <= value <= 1000:
-        await send_reply(update, "The message limit must be from 50 to 1000.")
+        await send_reply(update, context, "❌ The message limit must be from 50 to 1000.")
         return
     set_group_settings(update.effective_chat.id, {"message_limit": value})
-    await send_reply(update, f"✅ New members need {value} text messages to unlock stickers and GIFs.")
+    await send_reply(
+        update,
+        context,
+        f"✅ New members need <b>{value}</b> text messages to unlock stickers and GIFs.",
+        parse_mode="HTML",
+    )
 
 
 async def set_admin_setting(
@@ -638,17 +980,21 @@ async def set_admin_setting(
     maximum: int,
     duration: bool = False,
 ) -> None:
-    if not await admin_only(update):
+    if not await admin_only(update, context):
         return
     if not context.args:
         suffix = " (for example 30s, 5m, 3d)" if duration else f" ({minimum}-{maximum})"
-        await send_reply(update, f"Usage: /{context.effective_message.text.split()[0][1:]} <value>{suffix}.")
+        await send_reply(
+            update, context,
+            f"ℹ️ Usage: /{context.effective_message.text.split()[0][1:]} <value>{suffix}.",
+        )
         return
     if duration:
         value = parse_duration(context.args[0])
         if value is None or not minimum <= value <= maximum:
             await send_reply(
                 update,
+                context,
                 f"{label} must be from {format_duration(minimum)} to {format_duration(maximum)}.",
             )
             return
@@ -656,14 +1002,14 @@ async def set_admin_setting(
         try:
             value = int(context.args[0])
         except ValueError:
-            await send_reply(update, f"{label} must be a whole number from {minimum} to {maximum}.")
+            await send_reply(update, context, f"❌ {label} must be a whole number from {minimum} to {maximum}.")
             return
         if not minimum <= value <= maximum:
-            await send_reply(update, f"{label} must be from {minimum} to {maximum}.")
+            await send_reply(update, context, f"❌ {label} must be from {minimum} to {maximum}.")
             return
     set_group_settings(update.effective_chat.id, {setting: value})
     shown_value = format_duration(value) if duration else str(value)
-    await send_reply(update, f"✅ {label} set to {shown_value}.")
+    await send_reply(update, context, f"✅ {label} set to <b>{shown_value}</b>.", parse_mode="HTML")
 
 
 async def set_violations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -695,20 +1041,21 @@ async def set_warning_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await admin_only(update):
+    if not await admin_only(update, context):
         return
     values = get_group_settings(update.effective_chat.id)
     text = (
-        "⚙️ Sticker/GIF guard settings\n"
-        f"Message limit: {values['message_limit']} (owner only)\n"
-        f"Violations before mute: {values['violation_limit']}\n"
-        f"Violation window: {format_duration(values['violation_window'])}\n"
-        f"Mute duration: {format_duration(values['mute_duration'])}\n"
-        f"Warning auto-delete: {format_duration(values['warning_duration'])}"
+        "⚙️ <b>Sticker &amp; GIF guard</b>\n\n"
+        f"🎯 Message limit: <b>{values['message_limit']}</b> (owner only)\n"
+        f"⚠️ Violations before mute: <b>{values['violation_limit']}</b>\n"
+        f"⏱️ Violation window: <b>{format_duration(values['violation_window'])}</b>\n"
+        f"🔇 Mute duration: <b>{format_duration(values['mute_duration'])}</b>\n"
+        f"🧹 Warning lifetime: <b>{format_duration(values['warning_duration'])}</b>"
     )
-    await send_reply(update, text)
+    await send_reply(update, context, text, parse_mode="HTML")
 
 
+# Message moderation and membership lifecycle
 def is_restricted_content(message: Message) -> bool:
     return bool(
         message.sticker
@@ -718,22 +1065,6 @@ def is_restricted_content(message: Message) -> bool:
             and (message.document.mime_type or "").lower() == "image/gif"
         )
     )
-
-
-async def delete_warning(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    if job is None:
-        return
-    try:
-        await context.application.bot.delete_message(
-            chat_id=job.data["chat_id"], message_id=job.data["message_id"]
-        )
-    except BadRequest as error:
-        LOGGER.debug("Could not delete expired warning: %s", error)
-    else:
-        clear_pending_warning(job.data["chat_id"], job.data["message_id"])
-        return
-    clear_pending_warning(job.data["chat_id"], job.data["message_id"])
 
 
 async def send_warning(
@@ -746,21 +1077,13 @@ async def send_warning(
     if user is None or update.effective_message is None:
         return
     mention = f'<a href="tg://user?id={user.id}">{escape(user.full_name)}</a>'
-    sent = await context.application.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"{mention}, {text}",
+    await send_message_with_auto_delete(
+        context,
+        update.effective_chat.id,
+        f"⚠️ {mention}, {text}",
+        delete_after_seconds=duration,
         parse_mode="HTML",
         disable_web_page_preview=True,
-    )
-    if context.job_queue is None:
-        raise RuntimeError("The Telegram JobQueue is unavailable; install python-telegram-bot[job-queue].")
-    delete_at = time.time() + duration
-    save_pending_warning(sent.chat_id, sent.message_id, delete_at)
-    context.job_queue.run_once(
-        delete_warning,
-        when=max(0.1, delete_at - time.time()),
-        data={"chat_id": sent.chat_id, "message_id": sent.message_id},
-        name=f"warning-{sent.chat_id}-{sent.message_id}",
     )
 
 
@@ -793,7 +1116,7 @@ async def mute_member(
     await send_warning(
         update,
         context,
-        f"you've been muted for {format_duration(settings_data['mute_duration'])} "
+        f"you've been muted for <b>{format_duration(settings_data['mute_duration'])}</b> "
         f"after {violation_count} sticker/GIF violations. Please follow the group rules.",
         settings_data["warning_duration"],
     )
@@ -834,17 +1157,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 update,
                 context,
                 f"stickers and GIFs are locked until you send "
-                f"{settings_data['message_limit']} text messages. "
-                f"Violation {violation_count}/{settings_data['violation_limit']}; "
-                f"{remaining} more violation(s) in {format_duration(settings_data['violation_window'])} "
-                f"will mute you for {format_duration(settings_data['mute_duration'])}.",
+                f"<b>{settings_data['message_limit']}</b> text messages.\n\n"
+                f"Violation: <b>{violation_count}/{settings_data['violation_limit']}</b>\n"
+                f"Next {remaining} violation(s) within "
+                f"{format_duration(settings_data['violation_window'])} will mute you for "
+                f"{format_duration(settings_data['mute_duration'])}.",
                 settings_data["warning_duration"],
             )
         return
     if message.text and not message.text.startswith("/"):
-        record_text_message(
+        settings_data = get_group_settings(update.effective_chat.id)
+        prior_progress = get_task_progress(
+            update.effective_chat.id, user.id, MESSAGE_UNLOCK_TASK
+        )
+        if prior_progress["completed"]:
+            return
+        count = record_text_message(
             update.effective_chat.id, user.id, user.username, user.full_name
         )
+        if count >= settings_data["message_limit"]:
+            await send_message_with_auto_delete(
+                context,
+                update.effective_chat.id,
+                format_completion_message(settings_data["message_limit"]),
+                parse_mode="HTML",
+            )
 
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -916,15 +1253,16 @@ async def post_init(application: Application) -> None:
             LOGGER.exception("Could not refresh command visibility for chat %s", chat_id)
     if application.job_queue is None:
         raise RuntimeError("The Telegram JobQueue is unavailable; install python-telegram-bot[job-queue].")
-    for warning in get_pending_warnings():
+    for warning in get_pending_deletions():
         application.job_queue.run_once(
-            delete_warning,
+            delete_scheduled_message,
             when=max(0.1, warning["delete_at"] - time.time()),
             data={"chat_id": warning["chat_id"], "message_id": warning["message_id"]},
-            name=f"warning-{warning['chat_id']}-{warning['message_id']}",
+            name=f"delete-{warning['chat_id']}-{warning['message_id']}",
         )
 
 
+# Application startup and polling
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.error:
         LOGGER.error(
@@ -953,6 +1291,9 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("mutetime", set_mute_time))
     application.add_handler(CommandHandler("warntime", set_warning_time))
     application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(
+        CallbackQueryHandler(show_rules_callback, pattern="^guard_rules$")
+    )
 
     application.add_handler(
         MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member), group=-1
