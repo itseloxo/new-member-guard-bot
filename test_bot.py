@@ -235,6 +235,58 @@ class MessageFormattingTests(unittest.TestCase):
         self.assertIn("<b>50</b> text messages", rules)
         self.assertIn("<b>10m</b> mute", rules)
 
+    def test_completion_message_mentions_member(self):
+        message = bot.format_completion_message(50, 42, "A <Member>")
+        self.assertIn('<a href="tg://user?id=42">A &lt;Member&gt;</a>', message)
+        self.assertIn("✅ Stickers and GIFs are now unlocked.", message)
+
+    def test_warning_count_button_uses_count_callback(self):
+        button = bot.count_button_markup().inline_keyboard[0][0]
+        self.assertEqual(button.text, "📊 Check my count")
+        self.assertEqual(button.callback_data, "guard_count")
+
+
+class CountButtonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_count_button_sends_clicking_member_their_progress(self):
+        user = SimpleNamespace(id=42)
+        message = SimpleNamespace(chat_id=-1001)
+        query = SimpleNamespace(
+            message=message,
+            from_user=user,
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=-1001, type="supergroup"),
+            effective_user=user,
+        )
+        sender = AsyncMock(
+            return_value=SimpleNamespace(chat_id=-1001, message_id=51)
+        )
+        job_queue = MagicMock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot=SimpleNamespace(send_message=sender)),
+            job_queue=job_queue,
+        )
+
+        with patch.object(bot, "allow_group_interaction", new=AsyncMock(return_value=True)), patch.object(
+            bot, "get_member_record", return_value={"message_count": 12, "task_completed": 0}
+        ), patch.object(
+            bot,
+            "get_group_settings",
+            return_value={"message_limit": 50},
+        ), patch.object(
+            bot, "save_pending_deletion"
+        ), patch.object(
+            bot.time, "time", return_value=1000.0
+        ):
+            await bot.show_count_callback(update, context)
+
+        query.answer.assert_awaited_once_with()
+        sender.assert_awaited_once()
+        self.assertIn("12 / 50", sender.call_args.kwargs["text"])
+        self.assertEqual(sender.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "guard_rules")
+
 
 class DurationTests(unittest.TestCase):
     def test_parses_supported_duration_formats(self):

@@ -761,12 +761,18 @@ def format_task_message(count: int, limit: int, completed: bool) -> str:
     )
 
 
-def format_completion_message(limit: int) -> str:
+def format_completion_message(limit: int, user_id: int, full_name: str) -> str:
     return (
-        "✨ <b>UNLOCK COMPLETE</b> ✨\n"
+        f'✨ <b>UNLOCK COMPLETE</b> ✨\n👤 <a href="tg://user?id={user_id}">{escape(full_name)}</a>\n'
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"📨 Goal reached: <b>{limit}</b> messages\n"
         "✅ Stickers and GIFs are now unlocked. 🏆"
+    )
+
+
+def count_button_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📊 Check my count", callback_data="guard_count")]]
     )
 
 
@@ -848,6 +854,36 @@ async def count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_reply(
         update,
         context,
+        format_task_message(message_count, settings["message_limit"], completed),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📜 View group rules", callback_data="guard_rules")],
+                [InlineKeyboardButton("📊 Check my count", callback_data="guard_count")],
+            ]
+        ),
+    )
+
+
+async def show_count_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+    if not await allow_group_interaction(update, "count_button"):
+        await query.answer("Please wait a minute before checking again.")
+        return
+    await query.answer()
+    user = query.from_user
+    chat_id = query.message.chat_id
+    member = get_member_record(chat_id, user.id)
+    settings = get_group_settings(chat_id)
+    message_count = member["message_count"] if member else 0
+    completed = bool(member and member["task_completed"])
+    await send_message_with_auto_delete(
+        context,
+        chat_id,
         format_task_message(message_count, settings["message_limit"], completed),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
@@ -1120,9 +1156,10 @@ async def send_warning(
     await send_message_with_auto_delete(
         context,
         update.effective_chat.id,
-        f"⚠️ {mention}, {text}",
+        f"⚠️ {mention}, {text}\n\n👇 Tap the button below to check your count.",
         parse_mode="HTML",
         disable_web_page_preview=True,
+        reply_markup=count_button_markup(),
     )
 
 
@@ -1216,7 +1253,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await send_message_with_auto_delete(
                 context,
                 update.effective_chat.id,
-                format_completion_message(settings_data["message_limit"]),
+                format_completion_message(
+                    settings_data["message_limit"], user.id, user.full_name
+                ),
                 parse_mode="HTML",
             )
 
@@ -1334,6 +1373,9 @@ def build_application(token: str) -> Application:
         )
     application.add_handler(
         CallbackQueryHandler(show_rules_callback, pattern="^guard_rules$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(show_count_callback, pattern="^guard_count$")
     )
 
     application.add_handler(
